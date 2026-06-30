@@ -39,6 +39,7 @@ def top_percent_mask(value_map, percent, *, xp=np):
     flat = value_map.reshape(-1)
     n = flat.shape[0]
     ordered = xp.sort(flat)
+    ordered = getattr(ordered, "values", ordered)
     k = int(np.floor((1.0 - percent / 100.0) * n))
     k = max(0, min(k, n - 1))
     threshold = ordered[k]

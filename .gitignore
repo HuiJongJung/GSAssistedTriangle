@@ -30,3 +30,8 @@ Thumbs.db
 
 !datasets/.gitkeep
 !outputs/.gitkeep
+
+*.egg-info/
+
+# Upstream baseline (re-cloned per machine, large: submodules + CUDA build)
+third_party/triangle-splatting2/
