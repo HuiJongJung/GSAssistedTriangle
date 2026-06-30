@@ -1,0 +1,19 @@
+experiment_name: gs_assisted_triangle_plus_v2
+variant: A_baseline_triangle_only
+method: triangle_splatting2
+dataset: mipnerf360
+scene: bicycle
+dataset_path: datasets/mipnerf360/bicycle
+output_root: outputs/gs_assisted_triangle_plus_v2
+images: images_4
+resolution: 1
+eval: true
+iterations: 30000
+save_percent_interval: 10
+metrics:
+  - psnr
+  - ssim
+  - lpips
+notes:
+  - Runs the clean upstream Triangle Splatting+ submodule.
+  - Does not use residual Gaussians.

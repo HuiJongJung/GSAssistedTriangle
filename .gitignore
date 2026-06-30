@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local experiment data and products
+datasets/*
+outputs/*
+*.log
+
+# Large model artifacts
+*.pt
+*.pth
+*.ply
+*.ckpt
+
+# Local environments
+.env
+.venv/
+env/
+venv/
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+!datasets/.gitkeep
+!outputs/.gitkeep

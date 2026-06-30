@@ -1,0 +1,35 @@
+experiment_name: gs_assisted_triangle_plus_v2
+dataset: mipnerf360
+scene: bicycle
+dataset_path: datasets/mipnerf360/bicycle
+output_root: outputs/gs_assisted_triangle_plus_v2
+images: images_4
+resolution: 1
+eval: true
+iterations: 30000
+save_percent_interval: 10
+variants:
+  baseline: A_baseline_triangle_only
+  mixed: B_ours_mixed_triangle_gs
+  converted: C_ours_converted_triangle_only
+gs_policy:
+  start_iter: auto
+  residual_top_percent: 10
+  max_triangle_contribution: 0.35
+  min_checkpoint_repeats: 2
+  min_view_repeats: 3
+  max_insert_per_event: 5000
+  max_total_gs: 100000
+loss:
+  lambda_dssim: 0.2
+  gs_sparse_weight: 0.001
+  gs_mask_weight: 0.01
+conversion:
+  mode: local_patch
+  finetune_iters: 3000
+diagnostics:
+  save_t_only: true
+  save_g_only: true
+  save_t_plus_g: true
+  save_gs_red_overlay: true
+  save_alpha_depth_contribution: true

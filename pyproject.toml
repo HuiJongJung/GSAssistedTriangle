@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gs-assisted-triangle"
+version = "0.1.0"
+description = "GS-assisted Triangle Splatting+ experiment harness"
+requires-python = ">=3.9"
+dependencies = [
+  "pyyaml",
+  "numpy",
+]
+
+# GPU-only extras. Installed on the training server, not needed for the CPU
+# unit tests. torch must match the server CUDA toolkit; install it from the
+# appropriate index before `pip install .[gpu]`.
+[project.optional-dependencies]
+gpu = [
+  "gsplat",
+  "torchvision",
+]
+test = [
+  "pytest",
+]
+
+[tool.setuptools.packages.find]
+include = ["gs_assisted*"]

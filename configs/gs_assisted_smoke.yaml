@@ -1,0 +1,31 @@
+experiment_name: gs_assisted_triangle_plus_v2
+dataset: mipnerf360
+scene: bicycle
+dataset_path: datasets/mipnerf360/bicycle
+output_root: outputs/gs_assisted_triangle_plus_v2
+images: images_4
+resolution: 1
+eval: true
+
+# Tiny run to validate that A/B/C produce metrics/renders/diagnostics on the
+# same schedule before committing to a full 30k experiment.
+iterations: 300
+save_percent_interval: 10
+gs_start_iter: 100
+composite_mode: depth_aware
+gs_policy:
+  start_iter: 100
+  residual_top_percent: 10
+  max_triangle_contribution: 0.35
+  min_checkpoint_repeats: 2
+  min_view_repeats: 3
+  max_insert_per_event: 500
+  max_total_gs: 1000
+loss:
+  lambda_dssim: 0.2
+  gs_sparse_weight: 0.001
+  gs_mask_weight: 0.01
+conversion:
+  mode: local_patch
+  finetune_iters: 100
+  size_factor: 3.0
