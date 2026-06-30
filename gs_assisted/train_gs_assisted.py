@@ -111,7 +111,7 @@ def training_b(args, paths):
     # ---- residual-Gaussian branch state --------------------------------
     gs_branch = None
     gs_optimizer = None
-    recent_checkpoint_masks = []   # accepted candidate masks at recent save points
+    cand_history = {}   # camera key -> recent per-view candidate masks (view-consistent)
     t0 = time.time()
 
     viewpoint_stack = scene.getTrainCameras().copy()
@@ -151,6 +151,28 @@ def training_b(args, paths):
         m = importance_score > triangles.importance_score
         triangles.importance_score[m] = importance_score[m]
 
+        # ---- per-camera residual-region evidence (view-consistent) -----
+        # Pixel coordinates are only comparable within one camera, so this view's
+        # candidate mask is accumulated under its own camera key and a region is
+        # accepted only where the SAME camera shows it repeatedly. This replaces
+        # the earlier global list, which intersected masks from different random
+        # views (geometrically meaningless across cameras).
+        accepted = None
+        if iteration >= gs_start_iter:
+            with torch.no_grad():
+                cand = rmask.candidate_mask(
+                    render_pkg["render"], gt_image, render_pkg["rend_alpha"],
+                    residual_top_percent=policy.residual_top_percent,
+                    max_triangle_contribution=policy.max_triangle_contribution,
+                    xp=torch,
+                )
+                hist = cand_history.setdefault(_cam_key(viewpoint_cam), [])
+                hist.append(cand)
+                del hist[:-policy.min_checkpoint_repeats]  # keep last N for this camera
+                if len(hist) >= policy.min_checkpoint_repeats:
+                    accepted = rmask.repeated_region_mask(
+                        hist, policy.min_checkpoint_repeats, xp=torch)
+
         # ---- loss: triangle-only before gs_start, mixed afterwards -----
         gs_active = gs_branch is not None and iteration >= gs_start_iter
         if gs_active:
@@ -160,7 +182,6 @@ def training_b(args, paths):
             loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(comp, gt_image))
             l_gs_sparse = gs_branch.opacities.mean()
             gs_contrib = mixed_pkg["gs_alpha"]
-            accepted = _current_accept(recent_checkpoint_masks, policy, comp.device)
             if accepted is not None:
                 outside = (~accepted).float()
                 l_gs_mask = (gs_contrib * outside).mean()
@@ -188,10 +209,10 @@ def training_b(args, paths):
 
         with torch.no_grad():
             # ---- scheduled residual-GS insertion -----------------------
-            if iteration >= gs_start_iter and (iteration == gs_start_iter or iteration in save_iters):
-                _maybe_insert(args, policy, triangles, render_pkg, gt_image, viewpoint_cam,
-                              recent_checkpoint_masks, state={"branch": gs_branch})
-                gs_branch = _maybe_insert.last_branch
+            if (iteration == gs_start_iter or iteration in save_iters) and \
+                    accepted is not None and accepted.sum() > 0:
+                gs_branch = _insert_residual_gs(args, policy, gs_branch, accepted,
+                                                render_pkg, gt_image, viewpoint_cam)
                 if gs_branch is not None:
                     gs_optimizer = _rebuild_gs_optimizer(gs_branch, args)
 
@@ -216,60 +237,45 @@ def training_b(args, paths):
     _write_final_summary(mixed_dir, triangles, gs_branch, gs_start_iter, save_iters, args)
 
 
-def _current_accept(recent_checkpoint_masks, policy, device):
-    if len(recent_checkpoint_masks) == 0:
-        return None
-    import torch
-    masks = recent_checkpoint_masks[-policy.min_checkpoint_repeats:]
-    if len(masks) < policy.min_checkpoint_repeats:
-        return None
-    return rmask.repeated_region_mask(masks, policy.min_checkpoint_repeats, xp=torch)
+def _cam_key(cam):
+    """Stable per-camera key for view-consistent candidate accumulation.
+
+    Pixel masks are only comparable within one camera, so recurrence is tracked
+    per camera. Prefer the dataset uid, fall back to the image name / colmap id,
+    then the object id (camera objects are reused across epochs, so it is stable).
+    """
+    for attr in ("uid", "image_name", "colmap_id"):
+        val = getattr(cam, attr, None)
+        if val is not None:
+            return val
+    return id(cam)
 
 
-def _maybe_insert(args, policy, triangles, render_pkg, gt_image, cam,
-                  recent_checkpoint_masks, state):
-    """Compute a candidate mask, record it, and insert Gaussians when enough
-    evidence has accumulated. Stashes the (possibly new) branch on the function
-    object so the caller can retrieve it."""
+def _insert_residual_gs(args, policy, branch, accepted, render_pkg, gt_image, cam):
+    """Turn an accepted (already view-consistent) region into residual Gaussians.
+
+    The recurrence/persistence decision is made in the training loop from
+    per-camera evidence; this routine only back-projects the masked pixels and
+    initialises Gaussians under the capacity limits, returning the (possibly new
+    or grown) branch.
+    """
     import torch
     from gs_assisted.gs_backend import GaussianBranch
 
-    branch = state["branch"]
-    t_rgb = render_pkg["render"]
-    t_alpha = render_pkg["rend_alpha"]
-    t_depth = render_pkg["surf_depth"]
-
-    cand = rmask.candidate_mask(
-        t_rgb, gt_image, t_alpha,
-        residual_top_percent=policy.residual_top_percent,
-        max_triangle_contribution=policy.max_triangle_contribution,
-        xp=torch,
-    )
-    recent_checkpoint_masks.append(cand)
-    accepted = _current_accept(recent_checkpoint_masks, policy, t_rgb.device)
-    if accepted is None or accepted.sum() == 0:
-        _maybe_insert.last_branch = branch
-        return
-
-    residual = rmask.photometric_residual(t_rgb, gt_image, xp=torch)
+    residual = rmask.photometric_residual(render_pkg["render"], gt_image, xp=torch)
     current = 0 if branch is None else branch.count
-    params = build_insertion(cam, accepted, residual, t_depth, gt_image,
+    params = build_insertion(cam, accepted, residual, render_pkg["surf_depth"], gt_image,
                              current_gs_count=current, policy=policy,
                              init_scale=args.gs_init_scale)
     if params is None:
-        _maybe_insert.last_branch = branch
-        return
-
+        return branch
     if branch is None:
         branch = GaussianBranch(params["means"], params["scales_log"], params["quats"],
                                 params["opacities_logit"], params["colors_logit"])
     else:
         branch.append(params["means"], params["scales_log"], params["quats"],
                       params["opacities_logit"], params["colors_logit"])
-    _maybe_insert.last_branch = branch
-
-
-_maybe_insert.last_branch = None
+    return branch
 
 
 def _rebuild_gs_optimizer(gs_branch, args):
