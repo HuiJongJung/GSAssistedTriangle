@@ -143,6 +143,13 @@ def training_b(args, paths):
         image = render_pkg["render"]
         gt_image = viewpoint_cam.original_image.cuda()
 
+        # metric3d normal prior at image resolution, reused by both the geometry
+        # gate (below) and the triangle normal loss.
+        rend_normal = render_pkg["rend_normal"]
+        gt_normal_full = F.interpolate(
+            viewpoint_cam.normal_map.cuda().unsqueeze(0),
+            size=(gt_image.shape[1], gt_image.shape[2]), mode="area").squeeze(0)
+
         # bookkeeping used by upstream pruning
         image_size = render_pkg["scaling"].detach()
         m = image_size > triangles.image_size
@@ -151,19 +158,23 @@ def training_b(args, paths):
         m = importance_score > triangles.importance_score
         triangles.importance_score[m] = importance_score[m]
 
-        # ---- per-camera residual-region evidence (view-consistent) -----
-        # Pixel coordinates are only comparable within one camera, so this view's
-        # candidate mask is accumulated under its own camera key and a region is
-        # accepted only where the SAME camera shows it repeatedly. This replaces
-        # the earlier global list, which intersected masks from different random
-        # views (geometrically meaningless across cameras).
+        # ---- per-camera geometry-failure evidence (view-consistent) ----
+        # Recruitment now targets GEOMETRY failure (normal disagreement + depth
+        # instability + photometric residual), not the old residual ∩ (alpha<t)
+        # gate: once triangles saturate alpha ~ 1 that gate goes dead and only
+        # fires transiently in background triangles later cover. Pixel coords are
+        # only comparable within one camera, so a region is accepted only where
+        # the SAME camera shows it repeatedly.
         accepted = None
         if iteration >= gs_start_iter:
             with torch.no_grad():
-                cand = rmask.candidate_mask(
-                    render_pkg["render"], gt_image, render_pkg["rend_alpha"],
+                depth_inst = _depth_instability(render_pkg["surf_depth"])
+                cand = rmask.geometry_candidate_mask(
+                    render_pkg["render"], gt_image, rend_normal, gt_normal_full,
                     residual_top_percent=policy.residual_top_percent,
-                    max_triangle_contribution=policy.max_triangle_contribution,
+                    normal_top_percent=policy.normal_top_percent,
+                    depth_instability=depth_inst,
+                    depth_top_percent=policy.depth_top_percent,
                     xp=torch,
                 )
                 hist = cand_history.setdefault(_cam_key(viewpoint_cam), [])
@@ -173,46 +184,56 @@ def training_b(args, paths):
                     accepted = rmask.repeated_region_mask(
                         hist, policy.min_checkpoint_repeats, xp=torch)
 
-        # ---- loss: triangle-only before gs_start, mixed afterwards -----
-        gs_active = gs_branch is not None and iteration >= gs_start_iter
-        if gs_active:
-            mixed_pkg = render_mixed(render_pkg, gs_branch, viewpoint_cam, mode=args.composite_mode)
-            comp = mixed_pkg["mixed"]
-            pixel_loss = l1_loss(comp, gt_image)
-            loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(comp, gt_image))
-            l_gs_sparse = gs_branch.opacities.mean()
-            gs_contrib = mixed_pkg["gs_alpha"]
-            if accepted is not None:
-                outside = (~accepted).float()
-                l_gs_mask = (gs_contrib * outside).mean()
-            else:
-                l_gs_mask = gs_contrib.mean()
-            loss_gs = args.gs_sparse_weight * l_gs_sparse + args.gs_mask_weight * l_gs_mask
-        else:
-            pixel_loss = l1_loss(image, gt_image)
-            loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-            loss_gs = 0.0
+        # ---- DECOUPLED loss ------------------------------------------------
+        # Triangle branch: the exact baseline-A objective, ALWAYS (image loss on
+        # the triangle-only render). Because GS gradient never reaches triangles,
+        # B's triangle solution is identical-by-construction to baseline A -- the
+        # controlled comparison holds without a separate ablation.
+        pixel_loss = l1_loss(image, gt_image)
+        loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
-        rend_normal = render_pkg["rend_normal"]
-        gt_normal = viewpoint_cam.normal_map.cuda()
-        seg = F.interpolate(gt_normal.unsqueeze(0), size=(gt_image.shape[1], gt_image.shape[2]), mode="area").squeeze(0)
         lambda_normal = opt.lambda_normals if iteration > opt.iteration_mesh else 0
-        normal_loss = lambda_normal * ((1 - (rend_normal * seg).sum(dim=0))[None]).mean()
+        normal_loss = lambda_normal * ((1 - (rend_normal * gt_normal_full).sum(dim=0))[None]).mean()
 
         if iteration < opt.start_opacity_floor:
             loss_weight = triangles.get_vertex_weight[triangles._triangle_indices].mean() * lambda_weight
         else:
             loss_weight = 0
 
-        loss = loss_image + loss_weight + normal_loss + loss_gs
+        loss_tri = loss_image + loss_weight + normal_loss
+
+        # Residual-Gaussian branch: fits ONLY the residual the frozen triangles
+        # leave behind. Triangle tensors are detached so grad flows into GS alone;
+        # GS exist only where the geometry gate inserted them, so the gate controls
+        # WHERE and this objective controls how well they fill it. A light opacity
+        # sparsity keeps them from spreading; collapsed ones are pruned at saves.
+        gs_active = gs_branch is not None and iteration >= gs_start_iter
+        if gs_active:
+            t_frozen = {k: (v.detach() if torch.is_tensor(v) else v)
+                        for k, v in render_pkg.items()}
+            mixed_pkg = render_mixed(t_frozen, gs_branch, viewpoint_cam, mode=args.composite_mode)
+            comp = mixed_pkg["mixed"]
+            gs_pixel = l1_loss(comp, gt_image)
+            loss_gs_img = (1.0 - opt.lambda_dssim) * gs_pixel + opt.lambda_dssim * (1.0 - ssim(comp, gt_image))
+            loss_gs = loss_gs_img + args.gs_sparse_weight * gs_branch.opacities.mean()
+        else:
+            loss_gs = 0.0
+
+        loss = loss_tri + loss_gs
         loss.backward()
 
         with torch.no_grad():
             # ---- scheduled residual-GS insertion -----------------------
+            # Capacity and initial scale scale with scene size (triangle count /
+            # scene extent) instead of fixed magic numbers.
             if (iteration == gs_start_iter or iteration in save_iters) and \
                     accepted is not None and accepted.sum() > 0:
-                gs_branch = _insert_residual_gs(args, policy, gs_branch, accepted,
-                                                render_pkg, gt_image, viewpoint_cam)
+                tri_count = int(triangles._triangle_indices.shape[0])
+                dyn_policy = _dynamic_policy(policy, tri_count, args)
+                init_scale = _resolve_init_scale(args, triangles, tri_count)
+                gs_branch = _insert_residual_gs(args, dyn_policy, gs_branch, accepted,
+                                                render_pkg, gt_image, viewpoint_cam,
+                                                init_scale)
                 if gs_branch is not None:
                     gs_optimizer = _rebuild_gs_optimizer(gs_branch, args)
 
@@ -222,10 +243,24 @@ def training_b(args, paths):
             if iteration > opt.start_opacity_floor and iteration % 500 == 0:
                 prune_triangles += 0.01
 
+            # ---- residual-GS lifecycle: cull collapsed Gaussians -------
+            # A GS whose opacity has decayed below the floor was suppressed by the
+            # sparsity term because triangles took over its region (or it was never
+            # real geometry): remove it so the "temporary holder" stays temporary.
+            if gs_branch is not None and gs_branch.count > 0 and iteration in save_iters:
+                keep = (gs_branch.opacities.detach() >= args.gs_prune_opacity)
+                n_keep = int(keep.sum())
+                if n_keep == 0:
+                    gs_branch, gs_optimizer = None, None
+                elif n_keep < gs_branch.count:
+                    gs_branch.prune(keep)
+                    gs_optimizer = _rebuild_gs_optimizer(gs_branch, args)
+
             # ---- save checkpoint + diagnostics -------------------------
             if iteration in save_iters:
                 _save_checkpoint(mixed_dir, iteration, triangles, gs_branch, render_pkg,
-                                 gt_image, viewpoint_cam, args, t0, psnr, ssim)
+                                 gt_image, viewpoint_cam, args, t0, psnr, ssim,
+                                 scene=scene, render=render, pipe=pipe, background=background)
 
             if iteration < args.iterations:
                 triangles.optimizer.step()
@@ -251,7 +286,45 @@ def _cam_key(cam):
     return id(cam)
 
 
-def _insert_residual_gs(args, policy, branch, accepted, render_pkg, gt_image, cam):
+def _depth_instability(depth, k=7):
+    """Local depth variance as a geometry-instability map, shape ``[1, H, W]``.
+
+    High where the triangle surface depth is locally inconsistent (edges,
+    floaters, unstable geometry). Survives the opaque-triangle saturation that
+    kills the alpha gate, so it is a usable geometry-failure signal.
+    """
+    import torch.nn.functional as F
+    d = depth.unsqueeze(0)                       # [1,1,H,W]
+    pad = k // 2
+    mean = F.avg_pool2d(d, k, stride=1, padding=pad)
+    mean2 = F.avg_pool2d(d * d, k, stride=1, padding=pad)
+    var = (mean2 - mean * mean).clamp_min(0.0)
+    return var.squeeze(0)                         # [1,H,W]
+
+
+def _dynamic_policy(base_policy, triangle_count, args):
+    """Scale insertion caps to scene size (triangle count), clamped to floors and
+    the global ``--max-gs`` ceiling, instead of fixed magic numbers."""
+    from dataclasses import replace
+    max_total = min(int(args.max_gs),
+                    max(int(args.gs_min_total), round(args.gs_total_frac * triangle_count)))
+    max_event = max(int(args.gs_min_event), round(args.gs_event_frac * triangle_count))
+    return replace(base_policy, max_total_gs=max_total, max_insert_per_event=max_event)
+
+
+def _resolve_init_scale(args, triangles, triangle_count):
+    """Initial GS std: scene-proportional when ``--gs-init-scale-frac`` > 0
+    (frac * scene_diag / count**(1/3), i.e. ~ local primitive spacing), else the
+    fixed ``--gs-init-scale`` (backward compatible)."""
+    if args.gs_init_scale_frac and args.gs_init_scale_frac > 0 and triangle_count > 0:
+        v = triangles.vertices.detach()
+        diag = float((v.max(0).values - v.min(0).values).norm())
+        return args.gs_init_scale_frac * diag / max(1.0, triangle_count ** (1.0 / 3.0))
+    return args.gs_init_scale
+
+
+def _insert_residual_gs(args, policy, branch, accepted, render_pkg, gt_image, cam,
+                        init_scale):
     """Turn an accepted (already view-consistent) region into residual Gaussians.
 
     The recurrence/persistence decision is made in the training loop from
@@ -266,7 +339,7 @@ def _insert_residual_gs(args, policy, branch, accepted, render_pkg, gt_image, ca
     current = 0 if branch is None else branch.count
     params = build_insertion(cam, accepted, residual, render_pkg["surf_depth"], gt_image,
                              current_gs_count=current, policy=policy,
-                             init_scale=args.gs_init_scale)
+                             init_scale=init_scale)
     if params is None:
         return branch
     if branch is None:
@@ -318,8 +391,52 @@ def _triangle_maintenance(triangles, iteration, opt, prune_triangles, prune_size
                              probs_opacity=probs_opacity)
 
 
+def _evaluate_testset(scene, triangles, gs_branch, render, pipe, background, args,
+                      psnr, ssim):
+    """Average PSNR/SSIM over the held-out eval cameras (no_grad).
+
+    Standard NVS evaluation: render *every* test view and average, instead of
+    reading one random training view (which is optimistic and high-variance, and
+    spikes when a fresh insertion lands on the same iteration). Triangle-only is
+    always reported -- this is the number directly comparable to baseline A --
+    and mixed (T+G) is added only when residual Gaussians exist, so the two are
+    never conflated. ``--eval-max-views`` subsamples for speed during dev.
+    """
+    import torch
+    from gs_assisted.mixed_renderer import render_mixed
+
+    cams = scene.getTestCameras()
+    if not cams:  # dataset has no held-out split; fall back to train views
+        cams = scene.getTrainCameras()
+    if args.eval_max_views and args.eval_max_views > 0 and len(cams) > args.eval_max_views:
+        step = max(1, len(cams) // args.eval_max_views)
+        cams = cams[::step]
+
+    has_gs = gs_branch is not None and gs_branch.count > 0
+    tri_psnr = tri_ssim = mix_psnr = mix_ssim = 0.0
+    n = 0
+    with torch.no_grad():
+        for cam in cams:
+            pkg = render(cam, triangles, pipe, background)
+            gt = cam.original_image.cuda()
+            timg = pkg["render"].clamp(0, 1)
+            tri_psnr += float(psnr(timg, gt).mean())
+            tri_ssim += float(ssim(timg, gt))
+            if has_gs:
+                mimg = render_mixed(pkg, gs_branch, cam, mode=args.composite_mode)["mixed"].clamp(0, 1)
+                mix_psnr += float(psnr(mimg, gt).mean())
+                mix_ssim += float(ssim(mimg, gt))
+            n += 1
+    n = max(1, n)
+    out = {"eval_views": n,
+           "triangle_only": {"psnr": tri_psnr / n, "ssim": tri_ssim / n}}
+    if has_gs:
+        out["mixed"] = {"psnr": mix_psnr / n, "ssim": mix_ssim / n}
+    return out
+
+
 def _save_checkpoint(out_dir, iteration, triangles, gs_branch, render_pkg, gt_image,
-                     cam, args, t0, psnr, ssim):
+                     cam, args, t0, psnr, ssim, *, scene, render, pipe, background):
     import torch
     ckpt_dir = out_dir / f"iter_{iteration:06d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -341,18 +458,22 @@ def _save_checkpoint(out_dir, iteration, triangles, gs_branch, render_pkg, gt_im
         gs_ratio = float(gs_contribution_ratio(
             mixed_pkg["t_only"], mixed_pkg["g_only"], mixed_pkg["gs_alpha"],
             xp=torch, mixed=mixed_pkg["mixed"]))
-        eval_img = mixed_pkg["mixed"]
-    else:
-        eval_img = render_pkg["render"]
 
+    # Headline metrics: held-out TEST cameras (averaged), not a single random
+    # training view. Triangle-only PSNR is the number comparable to baseline A;
+    # mixed (T+G) is reported alongside under "eval" when GS exist.
+    eval_metrics = _evaluate_testset(scene, triangles, gs_branch, render, pipe,
+                                     background, args, psnr, ssim)
+    tri = eval_metrics["triangle_only"]
     rec = build_diagnostic_record(
         iteration=iteration,
         triangle_count=int(triangles._triangle_indices.shape[0]),
         gs_count=gs_count,
         gs_contribution_ratio=gs_ratio,
         wall_clock_s=time.time() - t0,
-        psnr=float(psnr(eval_img, gt_image).mean()),
-        ssim=float(ssim(eval_img, gt_image).mean()),
+        psnr=tri["psnr"],
+        ssim=tri["ssim"],
+        extra={"eval": eval_metrics},
     )
     (ckpt_dir / "diagnostics.json").write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
 
@@ -382,13 +503,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resolution", type=int, default=1)
     p.add_argument("--iterations", type=int, default=30000)
     p.add_argument("--save-percent-interval", type=int, default=10)
+    p.add_argument("--eval-max-views", type=int, default=0,
+                   help="cap held-out eval to this many test views (0 = all)")
     p.add_argument("--output-root", required=True, type=Path)
     p.add_argument("--gs-start-iter", type=int, default=-1)
     p.add_argument("--max-gs", type=int, default=100000)
     p.add_argument("--composite-mode", choices=["depth_aware", "over"], default="depth_aware")
     p.add_argument("--gs-sparse-weight", type=float, default=0.001)
-    p.add_argument("--gs-mask-weight", type=float, default=0.01)
-    p.add_argument("--gs-init-scale", type=float, default=0.01)
+    p.add_argument("--gs-mask-weight", type=float, default=0.01,
+                   help="(unused: the stale-mask penalty was removed under decoupled training)")
+    p.add_argument("--gs-init-scale", type=float, default=0.01,
+                   help="fixed initial GS std (used when --gs-init-scale-frac == 0)")
+    p.add_argument("--gs-init-scale-frac", type=float, default=0.0,
+                   help="if >0, scene-proportional init std = frac * scene_diag / count**(1/3)")
+    p.add_argument("--gs-total-frac", type=float, default=0.10,
+                   help="global GS cap as a fraction of the current triangle count")
+    p.add_argument("--gs-event-frac", type=float, default=0.02,
+                   help="per-event GS cap as a fraction of the current triangle count")
+    p.add_argument("--gs-min-total", type=int, default=2000, help="floor for the global GS cap")
+    p.add_argument("--gs-min-event", type=int, default=500, help="floor for the per-event GS cap")
+    p.add_argument("--gs-prune-opacity", type=float, default=0.01,
+                   help="cull residual Gaussians whose opacity decays below this at saves")
     p.add_argument("--gs-lr-means", type=float, default=1e-4)
     p.add_argument("--gs-lr-scales", type=float, default=5e-3)
     p.add_argument("--gs-lr-quats", type=float, default=1e-3)

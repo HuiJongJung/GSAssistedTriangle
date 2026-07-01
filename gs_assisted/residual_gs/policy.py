@@ -13,7 +13,9 @@ class ResidualGsPolicy:
     """
 
     residual_top_percent: float = 10.0
-    max_triangle_contribution: float = 0.35
+    max_triangle_contribution: float = 0.35   # legacy alpha gate (unused by geometry gate)
+    normal_top_percent: float = 15.0          # geometry gate: normal-disagreement percentile
+    depth_top_percent: float = 15.0           # geometry gate: depth-instability percentile
     min_checkpoint_repeats: int = 2
     min_view_repeats: int = 3
     max_insert_per_event: int = 5000

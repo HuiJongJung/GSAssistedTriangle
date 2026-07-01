@@ -53,14 +53,59 @@ def low_contribution_mask(triangle_alpha, max_triangle_contribution, *, xp=np):
 
 def candidate_mask(render_rgb, gt_rgb, triangle_alpha, *, residual_top_percent,
                    max_triangle_contribution, xp=np):
-    """A single view/checkpoint's candidate residual region.
+    """A single view/checkpoint's candidate residual region (legacy alpha gate).
 
     Intersection of "high photometric residual" and "low triangle contribution".
+    Kept for reference/tests; the training loop now uses
+    :func:`geometry_candidate_mask`, because the ``alpha < t`` gate goes dead once
+    Triangle Splatting+ saturates alpha ~ 1 everywhere (the residual Gaussians end
+    up recruited only transiently, in slow-converging background that triangles
+    later cover -- the "temporal recruitment mismatch").
     """
     res = photometric_residual(render_rgb, gt_rgb, xp=xp)
     hi_res = top_percent_mask(res, residual_top_percent, xp=xp)
     low_tri = low_contribution_mask(triangle_alpha, max_triangle_contribution, xp=xp)
     return hi_res & low_tri
+
+
+def normal_disagreement(rend_normal, gt_normal, *, xp=np):
+    """Per-pixel normal mismatch in ``[0, 1]``, shape ``[1, H, W]``.
+
+    ``rend_normal`` / ``gt_normal`` are ``[3, H, W]`` (assumed ~unit length).
+    ``0.5 * (1 - cos)`` is high where the rendered surface normal disagrees with
+    the monocular (metric3d) prior -- i.e. where the triangle geometry is *wrong*,
+    not merely textured. Unlike triangle alpha, this stays informative after the
+    opaque triangles have saturated alpha ~ 1, so it is a geometry-failure signal
+    rather than a coverage signal.
+    """
+    dot = (rend_normal * gt_normal).sum(0, keepdims=True)
+    dis = (1.0 - dot) * 0.5
+    return dis.clip(0.0, 1.0) if hasattr(dis, "clip") else xp.clip(dis, 0.0, 1.0)
+
+
+def geometry_candidate_mask(render_rgb, gt_rgb, rend_normal, gt_normal, *,
+                            residual_top_percent, normal_top_percent,
+                            depth_instability=None, depth_top_percent=None, xp=np):
+    """Candidate residual region driven by *geometry-failure* evidence.
+
+    Intersection of:
+      * high photometric residual (top ``residual_top_percent``), and
+      * high normal disagreement vs the metric3d prior (top ``normal_top_percent``),
+      * optionally high local depth instability (top ``depth_top_percent``), a
+        precomputed ``[1, H, W]`` variance map supplied by the training loop.
+
+    All signals are top-percent thresholded, hence scale-free. This replaces the
+    ``residual ∩ (alpha < t)`` gate so recruitment targets genuine geometry/topology
+    failure instead of fuzzy appearance residual (foliage) that should stay Gaussian
+    and must *not* be promoted to triangles.
+    """
+    res = photometric_residual(render_rgb, gt_rgb, xp=xp)
+    mask = top_percent_mask(res, residual_top_percent, xp=xp)
+    dis = normal_disagreement(rend_normal, gt_normal, xp=xp)
+    mask = mask & top_percent_mask(dis, normal_top_percent, xp=xp)
+    if depth_instability is not None and depth_top_percent is not None:
+        mask = mask & top_percent_mask(depth_instability, depth_top_percent, xp=xp)
+    return mask
 
 
 def accumulate(masks, *, xp=np):

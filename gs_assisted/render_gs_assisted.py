@@ -43,59 +43,93 @@ def _save(tensor, path: Path):
         np.save(str(path.with_suffix(".npy")), tensor.detach().cpu().numpy())
 
 
-def _red_overlay(t_rgb, gs_front, intensity=0.6):
-    """Tint the triangle render red where the Gaussian layer is in front."""
+def _red_painted(t_rgb, gs_alpha, *, gain=4.0, cap=0.65, floor=0.12, eps=1e-4):
+    """Tint the triangle render red wherever residual Gaussians sit.
+
+    A *see-through* diagnostic: every inserted Gaussian must be visible (even
+    near-transparent ones), yet the scene must still show through so the overlay
+    reads as "Gaussians live here" rather than a solid painted-over mask (the
+    old behaviour, where opaque isotropic Gaussians rendered as full-red discs).
+
+    - ``gain`` lifts faint Gaussians (real alpha is often ~0.05-0.15) into view;
+    - ``floor`` guarantees *every* footprint (alpha > eps) gets a minimum tint,
+      so sparse faint Gaussians are never lost;
+    - ``cap`` (< 1) keeps even dense/opaque Gaussians see-through.
+    """
     import torch
-    overlay = t_rgb.clone()
+    a = gs_alpha.clamp(0, 1)
+    strength = (a * gain).clamp(max=cap)
+    present = (a > eps).float()
+    strength = torch.maximum(strength, present * floor)
     red = torch.zeros_like(t_rgb)
     red[0] = 1.0
-    mask = gs_front  # [1,H,W] in {0,1}
-    return overlay * (1 - intensity * mask) + red * (intensity * mask)
+    return t_rgb * (1 - strength) + red * strength
+
+
+def _render_one(cam, triangles, branch, pipe, args, out):
+    """Write the diagnostic image set for a single camera into ``out``."""
+    import torch
+    from triangle_renderer import render
+    from gs_assisted.mixed_renderer import render_mixed
+
+    out.mkdir(parents=True, exist_ok=True)
+    bg = torch.tensor([0.0, 0.0, 0.0], device="cuda")
+    with torch.no_grad():
+        pkg = render(cam, triangles, pipe, bg)
+        _save(pkg["render"], out / "T_only.png")
+        _save(pkg["rend_alpha"].repeat(3, 1, 1), out / "T_alpha.png")
+        depth = pkg["surf_depth"]
+        _save((depth / (depth.max() + 1e-8)).repeat(3, 1, 1), out / "T_depth.png")
+
+        if branch is None:
+            return
+        mixed = render_mixed(pkg, branch, cam, mode=args.composite_mode)
+        gs = branch.render(cam)
+        _save(mixed["g_only"], out / "G_only.png")
+        _save(mixed["mixed"], out / "T_plus_G.png")
+        _save(_red_painted(pkg["render"], gs["alpha"],
+                           gain=args.red_gain, cap=args.red_cap, floor=args.red_floor),
+              out / "GS_red_overlay.png")
+        _save(gs["alpha"].repeat(3, 1, 1), out / "GS_alpha.png")
+        gd = gs["depth"]
+        _save((gd / (gd.max() + 1e-8)).repeat(3, 1, 1), out / "GS_depth.png")
 
 
 def render_diagnostics(args):
     import torch
     from scene import Scene, TriangleModel
-    from triangle_renderer import render
     from gs_assisted.gs_backend import GaussianBranch
-    from gs_assisted.mixed_renderer import render_mixed
     from gs_assisted.train_gs_assisted import build_upstream_configs
 
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    dataset, opt, pipe = build_upstream_configs(args, out)
+    out_root = Path(args.output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    dataset, opt, pipe = build_upstream_configs(args, out_root)
 
     throwaway = TriangleModel(dataset.sh_degree)
     scene = Scene(dataset, throwaway, opt.set_weight, opt.set_sigma)
     cams = scene.getTrainCameras()
-    cam = cams[args.view_index % len(cams)]
 
     triangles = TriangleModel(dataset.sh_degree)
     triangles.load_parameters(str(Path(args.model_path) / "triangles"))
 
-    bg = torch.tensor([0.0, 0.0, 0.0], device="cuda")
-    pkg = render(cam, triangles, pipe, bg)
-
-    _save(pkg["render"], out / "T_only.png")
-    _save(pkg["rend_alpha"].repeat(3, 1, 1), out / "T_alpha.png")
-    depth = pkg["surf_depth"]
-    _save((depth / (depth.max() + 1e-8)).repeat(3, 1, 1), out / "T_depth.png")
-
+    branch = None
     gpath = Path(args.model_path) / "gaussians.pt"
     if gpath.exists():
         st = torch.load(gpath, map_location="cuda")
         branch = GaussianBranch(st["means"], st["scales_log"], st["quats"],
                                 st["opacities_logit"], st["colors_logit"])
-        mixed = render_mixed(pkg, branch, cam, mode=args.composite_mode)
-        gs = branch.render(cam)
-        _save(mixed["g_only"], out / "G_only.png")
-        _save(mixed["mixed"], out / "T_plus_G.png")
-        _save(_red_overlay(pkg["render"], mixed["gs_front"]), out / "GS_red_overlay.png")
-        _save(gs["alpha"].repeat(3, 1, 1), out / "GS_alpha.png")
-        gd = gs["depth"]
-        _save((gd / (gd.max() + 1e-8)).repeat(3, 1, 1), out / "GS_depth.png")
     else:
-        print("[render] no gaussians.pt; wrote triangle-only diagnostics")
+        print("[render] no gaussians.pt; writing triangle-only diagnostics")
+
+    if args.all_views:
+        idxs = list(range(0, len(cams), max(1, args.stride)))
+    else:
+        idxs = [args.view_index % len(cams)]
+
+    for i in idxs:
+        sub = out_root / f"view_{i:04d}" if args.all_views else out_root
+        _render_one(cams[i], triangles, branch, pipe, args, sub)
+    print(f"[render] wrote {len(idxs)} view(s) to {out_root}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,8 +142,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-path", required=True, type=Path,
                    help="checkpoint dir with triangles/ (and optional gaussians.pt)")
     p.add_argument("--output-dir", required=True, type=Path)
-    p.add_argument("--view-index", type=int, default=0)
+    p.add_argument("--view-index", type=int, default=0,
+                   help="single view to render (ignored when --all-views is set)")
+    p.add_argument("--all-views", action="store_true",
+                   help="render every train camera into out/view_XXXX/ subdirs")
+    p.add_argument("--stride", type=int, default=1,
+                   help="with --all-views, render every Nth camera")
     p.add_argument("--composite-mode", choices=["depth_aware", "over"], default="depth_aware")
+    p.add_argument("--red-gain", type=float, default=4.0,
+                   help="overlay: multiplier that lifts faint Gaussians into view")
+    p.add_argument("--red-cap", type=float, default=0.65,
+                   help="overlay: max red strength (<1 keeps the scene see-through)")
+    p.add_argument("--red-floor", type=float, default=0.12,
+                   help="overlay: min tint for every Gaussian footprint")
     return p.parse_args()
 
 

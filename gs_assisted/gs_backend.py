@@ -105,6 +105,21 @@ class GaussianBranch(nn.Module):
         ]
 
     @torch.no_grad()
+    def prune(self, keep_mask):
+        """Drop Gaussians where ``keep_mask`` (``[N]`` bool) is False.
+
+        Used to cull residual Gaussians whose opacity has collapsed -- i.e. the
+        region got taken over by triangles (or was never real geometry), so the
+        "temporary holder" should be removed rather than left as suppressed
+        residue. Rebuild the optimiser afterwards (Parameters are replaced).
+        """
+        self._means = nn.Parameter(self._means[keep_mask])
+        self._scales = nn.Parameter(self._scales[keep_mask])
+        self._quats = nn.Parameter(self._quats[keep_mask])
+        self._opacities = nn.Parameter(self._opacities[keep_mask])
+        self._colors = nn.Parameter(self._colors[keep_mask])
+
+    @torch.no_grad()
     def append(self, means, scales_log, quats, opacities_logit, colors_logit):
         """Grow the branch in place (used by scheduled insertion events).
 
