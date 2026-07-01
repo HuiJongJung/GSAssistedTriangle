@@ -82,7 +82,8 @@ def convert_and_finetune(args, paths):
     from triangle_renderer import render
     from utils.loss_utils import l1_loss, ssim
     from utils.image_utils import psnr
-    from gs_assisted.train_gs_assisted import build_upstream_configs, _triangle_maintenance
+    from gs_assisted.train_gs_assisted import (
+        build_upstream_configs, _triangle_maintenance, _evaluate_testset)
 
     out_dir = paths["converted"]
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -131,21 +132,24 @@ def convert_and_finetune(args, paths):
                 triangles.optimizer.zero_grad(set_to_none=True)
 
     triangles.save_parameters(str(out_dir / "triangles"))
-    with torch.no_grad():
-        pkg = render(cams[0], triangles, pipe, background)
-        gt = cams[0].original_image.cuda()
-        rec = build_diagnostic_record(
-            iteration=args.finetune_iters,
-            triangle_count=int(triangles._triangle_indices.shape[0]),
-            gs_count=0,
-            gs_contribution_ratio=0.0,
-            wall_clock_s=time.time() - t0,
-            psnr=float(psnr(pkg["render"], gt).mean()),
-            ssim=float(ssim(pkg["render"], gt).mean()),
-            extra={"triangles_before_conversion": n_before,
-                   "triangles_after_conversion": n_after,
-                   "converted_from_gaussians": int(branch_state["means"].shape[0])},
-        )
+    # Same held-out test-set eval as A/B so the C-vs-A comparison is like-for-like
+    # (not a single training view).
+    eval_metrics = _evaluate_testset(scene, triangles, None, render, pipe, background,
+                                     args, psnr, ssim)
+    tri = eval_metrics["triangle_only"]
+    rec = build_diagnostic_record(
+        iteration=args.finetune_iters,
+        triangle_count=int(triangles._triangle_indices.shape[0]),
+        gs_count=0,
+        gs_contribution_ratio=0.0,
+        wall_clock_s=time.time() - t0,
+        psnr=tri["psnr"],
+        ssim=tri["ssim"],
+        extra={"eval": eval_metrics,
+               "triangles_before_conversion": n_before,
+               "triangles_after_conversion": n_after,
+               "converted_from_gaussians": int(branch_state["means"].shape[0])},
+    )
     (out_dir / "summary.json").write_text(json.dumps({
         "variant": "C_ours_converted_triangle_only",
         "source_checkpoint": str(ckpt),
@@ -171,6 +175,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--finetune-iters", type=int, default=3000)
     p.add_argument("--size-factor", type=float, default=3.0,
                    help="quad half-extent in Gaussian standard deviations")
+    p.add_argument("--eval-max-views", type=int, default=0,
+                   help="cap held-out eval to this many test views (0 = all)")
     return p.parse_args()
 
 
