@@ -100,6 +100,7 @@ def render_diagnostics(args):
     from scene import Scene, TriangleModel
     from gs_assisted.gs_backend import GaussianBranch
     from gs_assisted.train_gs_assisted import build_upstream_configs
+    from gs_assisted.progress import progress
 
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -126,7 +127,7 @@ def render_diagnostics(args):
     else:
         idxs = [args.view_index % len(cams)]
 
-    for i in idxs:
+    for i in progress(idxs, total=len(idxs), desc="render"):
         sub = out_root / f"view_{i:04d}" if args.all_views else out_root
         _render_one(cams[i], triangles, branch, pipe, args, sub)
     print(f"[render] wrote {len(idxs)} view(s) to {out_root}")

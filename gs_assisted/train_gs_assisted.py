@@ -78,6 +78,7 @@ def training_b(args, paths):
 
     from gs_assisted.gs_backend import GaussianBranch
     from gs_assisted.mixed_renderer import render_mixed
+    from gs_assisted.progress import progress
 
     mixed_dir = paths["mixed"]
     mixed_dir.mkdir(parents=True, exist_ok=True)
@@ -115,8 +116,11 @@ def training_b(args, paths):
     t0 = time.time()
 
     viewpoint_stack = scene.getTrainCameras().copy()
+    ema_loss = 0.0
+    pbar = progress(range(1, args.iterations + 1), total=args.iterations,
+                    desc=f"B {args.scene}")
 
-    for iteration in range(1, args.iterations + 1):
+    for iteration in pbar:
         if iteration == opt.start_upsampling:
             triangles.scaling = opt.upscaling_factor
         if iteration == 25000:
@@ -222,6 +226,12 @@ def training_b(args, paths):
         loss = loss_tri + loss_gs
         loss.backward()
 
+        ema_loss = 0.4 * float(loss.detach()) + 0.6 * ema_loss
+        if iteration % 10 == 0:
+            pbar.set_postfix(loss=f"{ema_loss:.4f}",
+                             tri=int(triangles._triangle_indices.shape[0]),
+                             gs=(gs_branch.count if gs_branch is not None else 0))
+
         with torch.no_grad():
             # ---- scheduled residual-GS insertion -----------------------
             # Capacity and initial scale scale with scene size (triangle count /
@@ -269,6 +279,7 @@ def training_b(args, paths):
                     gs_optimizer.step()
                     gs_optimizer.zero_grad(set_to_none=True)
 
+    pbar.close()
     _write_final_summary(mixed_dir, triangles, gs_branch, gs_start_iter, save_iters, args)
 
 

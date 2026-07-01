@@ -123,6 +123,7 @@ def convert_and_finetune(args, paths):
     from utils.image_utils import psnr
     from gs_assisted.train_gs_assisted import (
         build_upstream_configs, _triangle_maintenance, _evaluate_testset)
+    from gs_assisted.progress import progress
 
     out_dir = paths["converted"]
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -158,7 +159,10 @@ def convert_and_finetune(args, paths):
     prune_triangles = opt.prune_triangles_threshold
     t0 = time.time()
     stack = cams.copy()
-    for it in range(1, args.finetune_iters + 1):
+    ema_loss = 0.0
+    fpbar = progress(range(1, args.finetune_iters + 1), total=args.finetune_iters,
+                     desc=f"C {args.scene}")
+    for it in fpbar:
         triangles.update_learning_rate(it)
         if not stack:
             stack = cams.copy()
@@ -179,6 +183,10 @@ def convert_and_finetune(args, paths):
         pixel_loss = l1_loss(pkg["render"], gt)
         loss = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(pkg["render"], gt))
         loss.backward()
+        ema_loss = 0.4 * float(loss.detach()) + 0.6 * ema_loss
+        if it % 10 == 0:
+            fpbar.set_postfix(loss=f"{ema_loss:.4f}",
+                              tri=int(triangles._triangle_indices.shape[0]))
         with torch.no_grad():
             # Protect injected patches: no pruning/densify until they have had a
             # window to earn importance and settle.
@@ -188,6 +196,7 @@ def convert_and_finetune(args, paths):
             if it < args.finetune_iters:
                 triangles.optimizer.step()
                 triangles.optimizer.zero_grad(set_to_none=True)
+    fpbar.close()
 
     triangles.save_parameters(str(out_dir / "triangles"))
     # Same held-out test-set eval as A/B so the C-vs-A comparison is like-for-like
