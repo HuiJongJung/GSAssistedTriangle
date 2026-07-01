@@ -120,19 +120,6 @@ if [ "$DO_CONTROL" = 1 ]; then
     --output-root "$REPO/outputs/control_gsoff"
 fi
 
-# ---- diagnostics render (new see-through overlay) ------------------
-if [ "$DO_RENDER" = 1 ]; then
-  if [ -d "$BCKPT" ]; then
-    banner "diagnostics render -> outputs/diag/$SCENE"
-    run "$PY" gs_assisted/render_gs_assisted.py \
-      --triangle-root "$TRI" --dataset-path "$DATA" --images "$IMAGES" --resolution "$RES" \
-      --iterations "$ITERS" --model-path "$BCKPT" \
-      --output-dir "$REPO/outputs/diag/$SCENE" --view-index 0
-  else
-    echo "!! no B checkpoint at $BCKPT; skipping render"
-  fi
-fi
-
 # ---- C: convert GS -> triangles, finetune, eval --------------------
 if [ "$DO_C" = 1 ]; then
   if [ -f "$BCKPT/gaussians.pt" ]; then
@@ -144,6 +131,30 @@ if [ "$DO_C" = 1 ]; then
       --finetune-iters "$FINETUNE" --eval-max-views "$EVAL_MAX_VIEWS"
   else
     echo "!! no gaussians.pt at $BCKPT (GS never inserted?); skipping C"
+  fi
+fi
+
+# ---- diagnostics render: B (with GS) and C (converted triangle-only) -----
+# B's T_only is the baseline-triangle look (decoupled => B tris == A), T_plus_G
+# is triangles+GS, GS_red_overlay is where GS live; C is the converted mesh.
+if [ "$DO_RENDER" = 1 ]; then
+  banner "diagnostics render -> outputs/diag/$SCENE/{B,C}"
+  if [ -d "$BCKPT" ]; then
+    run "$PY" gs_assisted/render_gs_assisted.py \
+      --triangle-root "$TRI" --dataset-path "$DATA" --images "$IMAGES" --resolution "$RES" \
+      --iterations "$ITERS" --model-path "$BCKPT" \
+      --output-dir "$REPO/outputs/diag/$SCENE/B" --view-index 0
+  else
+    echo "!! no B checkpoint at $BCKPT; skipping B render"
+  fi
+  CDIR="$SROOT/C_ours_converted_triangle_only"
+  if [ -d "$CDIR/triangles" ]; then
+    run "$PY" gs_assisted/render_gs_assisted.py \
+      --triangle-root "$TRI" --dataset-path "$DATA" --images "$IMAGES" --resolution "$RES" \
+      --iterations "$ITERS" --model-path "$CDIR" \
+      --output-dir "$REPO/outputs/diag/$SCENE/C" --view-index 0
+  else
+    echo "!! no C model at $CDIR; skipping C render"
   fi
 fi
 
@@ -168,4 +179,6 @@ if os.path.exists(c):
     print("C (converted) PSNR:", round(d["metrics"]["psnr"], 3))
 PY
 echo
-echo "done. overlay: outputs/diag/$SCENE/GS_red_overlay.png"
+echo "done."
+echo "  B overlay : outputs/diag/$SCENE/B/GS_red_overlay.png  (+ T_only / T_plus_G / G_only)"
+echo "  C mesh    : outputs/diag/$SCENE/C/T_only.png          (converted triangle-only)"

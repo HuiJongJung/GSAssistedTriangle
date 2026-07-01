@@ -49,31 +49,70 @@ def _covariances(branch_state):
     return branch.covariances().cuda().float()
 
 
-def _inject_converted_triangles(triangles, branch_state, size_factor):
-    """Convert Gaussians and append them to ``triangles`` in place."""
+def _promotion_mask(branch_state, *, opacity_threshold, r_surface, r_flat):
+    """Select which Gaussians earn promotion to triangles.
+
+    Two conditions (both must hold):
+      * confident: opacity >= ``opacity_threshold`` (mature, not an uncertain probe);
+      * surface-like (rank ~ 2): two large axes, one thin. Needle (rank 1) and
+        blob/fuzzy (rank 3) Gaussians are left unconverted -- a flat quad misfits
+        them, and fuzzy appearance residual should not become mesh.
+
+    Rank is read from the per-axis std (covariance eigenvalues = std^2; rotation
+    does not change them), sorted s1>=s2>=s3: surface iff s2/s1 >= r_surface AND
+    s3/s1 <= r_flat. Returns ``(keep[bool N], stats)``.
+    """
+    import torch
+    scales = torch.exp(branch_state["scales_log"].cuda().float())
+    s, _ = torch.sort(scales, dim=1, descending=True)
+    s1 = s[:, 0].clamp_min(1e-9); s2 = s[:, 1]; s3 = s[:, 2]
+    is_surface = (s2 / s1 >= r_surface) & (s3 / s1 <= r_flat)
+    op = torch.sigmoid(branch_state["opacities_logit"].cuda().float())
+    confident = op >= opacity_threshold
+    keep = is_surface & confident
+    stats = {
+        "n_total": int(op.numel()),
+        "n_surface_like": int(is_surface.sum()),
+        "n_confident": int(confident.sum()),
+        "n_promoted": int(keep.sum()),
+    }
+    return keep, stats
+
+
+def _inject_converted_triangles(triangles, branch_state, size_factor, keep):
+    """Convert the *kept* Gaussians and append them to ``triangles`` in place.
+
+    Returns ``(tri_before, tri_after)`` triangle counts (equal if nothing kept).
+    """
     import torch
 
-    means = branch_state["means"].cuda().float()
-    covs = _covariances(branch_state)                                 # [N,3,3]
-    colors = torch.sigmoid(branch_state["colors_logit"].cuda().float())     # [N,3]
-    opacities = torch.sigmoid(branch_state["opacities_logit"].cuda().float())  # [N]
+    tri_before = int(triangles._triangle_indices.shape[0])
+    idx = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+    if idx.numel() == 0:
+        return tri_before, tri_before
+
+    means = branch_state["means"].cuda().float()[idx]
+    covs = _covariances(branch_state)[idx]                            # [M,3,3]
+    colors = torch.sigmoid(branch_state["colors_logit"].cuda().float())[idx]     # [M,3]
+    opacities = torch.sigmoid(branch_state["opacities_logit"].cuda().float())[idx]  # [M]
 
     out = geo.gaussians_to_triangles(means, covs, colors, opacities,
                                      size_factor=size_factor, xp=torch)
-    new_vertices = out["vertices"].cuda().float()                     # [4N,3]
-    sh_dc = out["sh_dc"].cuda().float()                               # [4N,3]
-    op = out["opacity"].cuda().float().clamp(1e-6, 1 - 1e-6)          # [4N]
+    new_vertices = out["vertices"].cuda().float()                     # [4M,3]
+    sh_dc = out["sh_dc"].cuda().float()                               # [4M,3]
+    op = out["opacity"].cuda().float().clamp(1e-6, 1 - 1e-6)          # [4M]
 
     base = triangles.vertices.shape[0]
     new_triangles = (torch.as_tensor(out["triangles"], device="cuda") + base).to(torch.int32)
 
-    new_features_dc = sh_dc.unsqueeze(1)                              # [4N,1,3]
+    new_features_dc = sh_dc.unsqueeze(1)                              # [4M,1,3]
     rest = triangles._features_rest.shape[1]
     new_features_rest = torch.zeros((sh_dc.shape[0], rest, 3), device="cuda")
     new_vertex_weight = triangles.inverse_opacity_activation(op.unsqueeze(-1))
 
     triangles.densification_postfix(new_vertices, new_vertex_weight,
                                     new_features_dc, new_features_rest, new_triangles)
+    return tri_before, int(triangles._triangle_indices.shape[0])
 
 
 def convert_and_finetune(args, paths):
@@ -104,9 +143,14 @@ def convert_and_finetune(args, paths):
     triangles = TriangleModel(dataset.sh_degree)
     triangles.load_parameters(str(ckpt / "triangles"))
     triangles.training_setup(opt, opt.feature_lr, opt.weight_lr, opt.lr_triangles_points_init)
-    n_before = int(triangles._triangle_indices.shape[0])
-    _inject_converted_triangles(triangles, branch_state, args.size_factor)
-    n_after = int(triangles._triangle_indices.shape[0])
+    keep, promo_stats = _promotion_mask(
+        branch_state, opacity_threshold=args.opacity_threshold,
+        r_surface=args.surface_ratio, r_flat=args.flat_ratio)
+    n_before, n_after = _inject_converted_triangles(
+        triangles, branch_state, args.size_factor, keep)
+    print(f"[C] promote {promo_stats['n_promoted']}/{promo_stats['n_total']} GS "
+          f"(surface-like {promo_stats['n_surface_like']}, confident {promo_stats['n_confident']})"
+          f" -> triangles {n_before} -> {n_after}")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -121,12 +165,26 @@ def convert_and_finetune(args, paths):
         cam = stack.pop(randint(0, len(stack) - 1))
         pkg = render(cam, triangles, pipe, background)
         gt = cam.original_image.cuda()
+
+        # Keep pruning bookkeeping live (mirrors training_b) so maintenance judges
+        # the freshly injected patches on real usage, not stale zeros -- otherwise
+        # they get pruned before they ever contribute.
+        image_size = pkg["scaling"].detach()
+        m = image_size > triangles.image_size
+        triangles.image_size[m] = image_size[m]
+        importance = pkg["max_blending"].detach()
+        m = importance > triangles.importance_score
+        triangles.importance_score[m] = importance[m]
+
         pixel_loss = l1_loss(pkg["render"], gt)
         loss = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(pkg["render"], gt))
         loss.backward()
         with torch.no_grad():
-            _triangle_maintenance(triangles, it, opt, prune_triangles, opt.prune_size,
-                                  opt.splitt_large_triangles)
+            # Protect injected patches: no pruning/densify until they have had a
+            # window to earn importance and settle.
+            if it > args.protect_iters:
+                _triangle_maintenance(triangles, it, opt, prune_triangles, opt.prune_size,
+                                      opt.splitt_large_triangles)
             if it < args.finetune_iters:
                 triangles.optimizer.step()
                 triangles.optimizer.zero_grad(set_to_none=True)
@@ -148,7 +206,7 @@ def convert_and_finetune(args, paths):
         extra={"eval": eval_metrics,
                "triangles_before_conversion": n_before,
                "triangles_after_conversion": n_after,
-               "converted_from_gaussians": int(branch_state["means"].shape[0])},
+               "promotion": promo_stats},
     )
     (out_dir / "summary.json").write_text(json.dumps({
         "variant": "C_ours_converted_triangle_only",
@@ -177,6 +235,15 @@ def parse_args() -> argparse.Namespace:
                    help="quad half-extent in Gaussian standard deviations")
     p.add_argument("--eval-max-views", type=int, default=0,
                    help="cap held-out eval to this many test views (0 = all)")
+    # --- selective / rank-aware promotion ---
+    p.add_argument("--opacity-threshold", type=float, default=0.2,
+                   help="promote only Gaussians with opacity >= this (confident)")
+    p.add_argument("--surface-ratio", type=float, default=0.3,
+                   help="surface-like if s2/s1 >= this (else needle -> not promoted)")
+    p.add_argument("--flat-ratio", type=float, default=0.3,
+                   help="surface-like if s3/s1 <= this (else blob/fuzzy -> not promoted)")
+    p.add_argument("--protect-iters", type=int, default=1000,
+                   help="no pruning/densify for the first N finetune iters (protect injected patches)")
     return p.parse_args()
 
 

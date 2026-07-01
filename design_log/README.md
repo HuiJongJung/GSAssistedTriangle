@@ -19,4 +19,5 @@
 
 ## 엔트리 목록 (최신 순)
 
+- [2026-07-01 · C 선택적·rank-aware 승격 + 주입 patch 보호 + A/B/C 렌더](2026-07-01-selective-rank-aware-conversion.md)
 - [2026-07-01 · v3 — 분리형 loss + geometry-evidence recruitment + GS 생애주기](2026-07-01-v3-decoupled-geometry-gate.md)
